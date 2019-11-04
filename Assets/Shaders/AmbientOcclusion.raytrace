@@ -1,0 +1,95 @@
+﻿#pragma max_recursion_depth 1
+
+#include "./Common.hlsl"
+
+#define MAX_DEPTH (0)
+#define MAX_SAMPLES (16)
+
+RaytracingAccelerationStructure _AccelerationStructure;
+
+Texture2D<float4> _NoiseTexture;
+Texture2D<float4> _GBuffer;
+RWTexture2D<float> _OutputTarget;
+float4 _OutputTargetSize;
+
+float3 SampleSphereUniform(float2 rand)
+{
+  float phi      = M_TWO_PI * rand.x;
+  float cosTheta = 1.0f - 2.0f * rand.y;
+
+  return SphericalToCartesian(phi, cosTheta);
+}
+
+// Cosine-weighted sampling without the tangent frame.
+// Ref: http://www.amietia.com/lambertnotangent.html
+float3 SampleHemisphereCosine(float2 rand, float3 normal)
+{
+  float3 pointOnSphere = SampleSphereUniform(rand);
+  return normalize(normal + pointOnSphere);
+}
+
+inline void GenerateCameraRay(out float3 origin, out float3 direction)
+{
+  float2 xy = DispatchRaysIndex().xy + 0.5f; // center in the middle of the pixel.
+  float2 screenPos = xy / DispatchRaysDimensions().xy * 2.0f - 1.0f;
+
+  // Un project the pixel coordinate into a ray.
+  float4 world = mul(_InvCameraViewProj, float4(screenPos, 1, 1));
+
+  world.xyz /= world.w;
+  origin = _WorldSpaceCameraPos.xyz;
+  direction = normalize(world.xyz - origin);
+}
+
+inline float3 GetWorldPositionByPixelCoordAndDepth(uint2 pixelCoord, float depth)
+{
+  float2 xy = pixelCoord + 0.5f; // center in the middle of the pixel.
+  float2 screenPos = xy / DispatchRaysDimensions().xy * 2.0f - 1.0f;
+
+  float4 world = mul(_InvCameraViewProj, float4(screenPos, depth, 1));
+  world.xyz /= world.w;
+  return world;
+}
+
+[shader("raygeneration")]
+void AmbientOcclusionGenShader()
+{
+  const uint2 dispatchIdx = DispatchRaysIndex().xy;
+  // pixel coordinate of the current pixel.
+  const uint2 currentPixelCoord = uint2(dispatchIdx.x, dispatchIdx.y);
+
+  float finalValue = 0.0f;
+  float4 normalAndDepth = LOAD_TEXTURE2D(_GBuffer, currentPixelCoord);
+  if (normalAndDepth.w != UNITY_RAW_FAR_CLIP_VALUE)
+  {
+    for (int i = 0; i < MAX_SAMPLES; ++i)
+    {
+      const uint2 noiseCoord = uint2((currentPixelCoord.x + i) % 256, (currentPixelCoord.y + i * i) % 256);
+      float3 positionWS = GetWorldPositionByPixelCoordAndDepth(currentPixelCoord, normalAndDepth.w);
+      float3 normalWS = normalAndDepth.xyz;
+      float3 directionWS = SampleHemisphereCosine(_NoiseTexture[noiseCoord].xy, normalWS);
+
+      RayDesc rayDescriptor;
+      rayDescriptor.Origin = positionWS - 1e-4f * normalWS;
+      rayDescriptor.Direction = directionWS;
+      rayDescriptor.TMin = 1e-5f;
+      rayDescriptor.TMax = 0.075f;
+
+      RayIntersectionAO rayIntersection;
+      rayIntersection.ao = 0.0f;
+
+      TraceRay(_AccelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, 0, rayDescriptor, rayIntersection);
+      finalValue += rayIntersection.ao;
+    }
+    finalValue /= MAX_SAMPLES;
+  }
+
+  // write out.
+  _OutputTarget[dispatchIdx] = finalValue;
+}
+
+[shader("miss")]
+void MissShader(inout RayIntersectionAO rayIntersection : SV_RayPayload)
+{
+  rayIntersection.ao = 0.0f;
+}

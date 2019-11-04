@@ -1,0 +1,18 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f77d8d839110ef944b7cdd0d7e0500b6, type: 3}
+  m_Name: AmbientOcclusionTutorialAsset
+  m_EditorClassIdentifier: 
+  shader: {fileID: 4807578003741378534, guid: cdaf074c9e722114ebc733c6ff192fa3, type: 3}
+  blitMaterial: {fileID: 2100000, guid: 70a3c3e85b188eb4db0d8d3e45e243e2, type: 2}
+  denoiserShader: {fileID: 7200000, guid: 30672b7713cd5904b8da0a203c2dc00b, type: 3}
+  blueNoiseTexture: {fileID: 2800000, guid: 8cb2fda9f52ce56489672c9175af85a9, type: 3}

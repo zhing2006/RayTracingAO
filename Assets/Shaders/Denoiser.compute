@@ -1,0 +1,189 @@
+﻿#pragma kernel BilateralFilter
+#pragma kernel Gather
+
+#include "./Common.hlsl"
+
+#define DENOISER_TILE_SIZE 8
+
+float4 _OutputTargetSize;
+
+Texture2D<float4> _NoiseTexture;
+Texture2D<float4> _GBuffer;
+Texture2D<float> _DenoiseInput;
+RWTexture2D<float> _DenoiseOutputRW;
+float _DenoiserFilterRadius;
+
+struct BilateralData
+{
+  float3 position;
+  float3 normal;
+  float  z01;
+};
+
+inline float3 GetWorldPositionByPixelCoordAndDepth(uint2 pixelCoord, float depth)
+{
+  float2 xy = pixelCoord + 0.5f; // center in the middle of the pixel.
+  float2 screenPos = xy / _OutputTargetSize.xy * 2.0f - 1.0f;
+
+  float4 world = mul(_InvCameraViewProj, float4(screenPos, depth, 1));
+  world.xyz /= world.w;
+  return world.xyz;
+}
+
+// Performs uniform sampling of the unit disk.
+// Ref: PBRT v3, p. 777.
+float2 SampleDiskUniform(float2 rand)
+{
+  float r   = sqrt(rand.x);
+  float phi = M_TWO_PI * rand.y;
+
+  float sinPhi, cosPhi;
+  sincos(phi, sinPhi, cosPhi);
+
+  return r * float2(cosPhi, sinPhi);
+}
+
+BilateralData TapBilateralData(uint2 coordSS)
+{
+  BilateralData key;
+
+  float4 normalAndDepth = LOAD_TEXTURE2D(_GBuffer, coordSS);
+  key.position = GetWorldPositionByPixelCoordAndDepth(coordSS, normalAndDepth.w);
+  key.normal = normalAndDepth.xyz;
+  key.z01 = normalAndDepth.w;
+
+  return key;
+}
+
+// Ref: 'ortho_basis_pixar_l2' from http://marc-b-reynolds.github.io/quaternions/2016/07/06/Orthonormal.html
+float3x3 GetLocalFrame(float3 localZ)
+{
+  float x  = localZ.x;
+  float y  = localZ.y;
+  float z  = localZ.z;
+  float sz = sgn(z);
+  float a  = 1.0f / (sz + z);
+  float ya = y * a;
+  float b  = x * ya;
+
+  float3 localX = float3(x * x * a - sz, b, x);
+  float3 localY = float3(b, y * ya - sz, y);
+
+  // Note: due to the quaternion formulation, the generated frame is rotated by 180 degrees,
+  // s.t. if localZ = {0, 0, 1}, then localX = {-1, 0, 0} and localY = {0, -1, 0}.
+  return float3x3(localX, localY, localZ);
+}
+
+float ComputeBilateralWeight(BilateralData center, BilateralData tap)
+{
+  float depthWeight  = 1.0f;
+  float normalWeight = 1.0f;
+  float planeWeight  = 1.0f;
+
+  depthWeight = max(0.0f, 1.0f - abs(tap.z01 - center.z01));
+
+  const float normalCloseness = sqr(sqr(max(0.0f, dot(tap.normal, center.normal))));
+  normalWeight = max(0.0f, normalCloseness);
+
+  // How far away is this point from the original sample
+  const float3 dq = center.position - tap.position;
+  const float distance = sqrt(dot(dq, dq));
+  const float3 d = dq / distance;
+
+  // How far off the expected plane (on the perpendicular) is this point? Max value is unbounded.
+  const float planeError = max(abs(dot(d, tap.normal)), abs(dot(d, center.normal)));
+  planeWeight = sqr(max(0.0f, 1.0f - 2.0f * planeError));
+
+  return depthWeight * normalWeight * planeWeight;
+}
+
+[numthreads(DENOISER_TILE_SIZE, DENOISER_TILE_SIZE, 1)]
+void BilateralFilter(uint3 dispatchThreadId : SV_DispatchThreadID, uint2 groupThreadId : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+  // Fetch the current pixel coordinate
+  const uint2 centerCoord = groupId * DENOISER_TILE_SIZE + groupThreadId;
+
+  // Read the central position
+  const BilateralData center = TapBilateralData(centerCoord);
+
+  if (center.z01 != UNITY_RAW_FAR_CLIP_VALUE)
+  {
+    // Create the local ortho basis for our sampling
+    float3x3 localToWorld = GetLocalFrame(center.normal);
+
+    float colorSum = 0.0;
+    float wSum = 0.0;
+    int numSamples = 16;
+    const float denoisingRadius = _DenoiserFilterRadius;
+
+    // Compute the sigma value
+    const float sigma = 0.5 * denoisingRadius;
+
+    // Loop through the samples that we need to aggrgate
+    for (uint sampleIndex = 0; sampleIndex < (uint)numSamples; ++sampleIndex)
+    {
+      float2 noiseCoord = uint2((centerCoord.x + sampleIndex) % 256, (centerCoord.y + sampleIndex * sampleIndex) % 256);
+      float2 newSample = SampleDiskUniform(_NoiseTexture[noiseCoord].zw);
+
+      // Distribute them according a square profile
+      newSample *= denoisingRadius * denoisingRadius;
+
+      // Convert the point to hemogenous clip space
+      float3 wsPos = center.position + localToWorld[0] * newSample.x + localToWorld[1] * newSample.y;
+      float4 hClip = mul(_CameraViewProj, float4(wsPos, 1.0f));
+      hClip.xyz /= hClip.w;
+
+      // Is the target pixel in the screen?
+      if (hClip.x > 1.0f || hClip.x < -1.0f || hClip.y > 1.0f || hClip.y < -1.0f)
+        continue;
+
+      // Convert it to screen sample space
+      float2 nDC = hClip.xy * 0.5f + 0.5f;
+
+      // Tap the data for this pixel
+      uint2 tapCoord = nDC * _OutputTargetSize.xy;
+      const BilateralData tapData = TapBilateralData(tapCoord);
+
+      if (tapData.z01 == UNITY_RAW_FAR_CLIP_VALUE)
+        continue;
+
+      // Compute the radius of the sample
+      float r = length(newSample);
+
+      // Compute the weight (skip computation for the center)
+      const float w = r > 0.001f ? gaussian(r, sigma) * ComputeBilateralWeight(center, tapData) : 1.0f;
+
+      // Accumulate the new sample
+      colorSum += LOAD_TEXTURE2D(_DenoiseInput, tapCoord).x * w;
+      wSum += w;
+    }
+
+    // If no samples were found, we take the center pixel only
+    if (wSum == 0.0f)
+    {
+      colorSum += LOAD_TEXTURE2D(_DenoiseInput, centerCoord).x;
+      wSum += 1.0f;
+    }
+
+    _DenoiseOutputRW[centerCoord] = colorSum / wSum;
+  }
+  else
+  {
+    _DenoiseOutputRW[centerCoord] = 0.0f;
+  }
+}
+
+[numthreads(DENOISER_TILE_SIZE, DENOISER_TILE_SIZE, 1)]
+void Gather(uint3 dispatchThreadId : SV_DispatchThreadID, uint2 groupThreadId : SV_GroupThreadID, uint2 groupId : SV_GroupID)
+{
+  // Fetch the current pixel coordinate
+  const uint2 centerCoord = groupId * DENOISER_TILE_SIZE + groupThreadId;
+
+  float color = LOAD_TEXTURE2D(_DenoiseInput, centerCoord * 2).x;
+  color += LOAD_TEXTURE2D(_DenoiseInput, centerCoord * 2 + uint2(1, 0)).x;
+  color += LOAD_TEXTURE2D(_DenoiseInput, centerCoord * 2 + uint2(0, 1)).x;
+  color += LOAD_TEXTURE2D(_DenoiseInput, centerCoord * 2 + uint2(1, 1)).x;
+  color *= 0.25f;
+  _DenoiseOutputRW[centerCoord] = color;
+}
+
