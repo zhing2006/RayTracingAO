@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "com.unity.render-pipelines.core": "file:../../../Unity/ScriptableRenderPipeline/com.unity.render-pipelines.core",
+    "com.unity.render-pipelines.core": "7.1.2",
     "com.unity.collab-proxy": "1.2.16",
     "com.unity.ext.nunit": "1.0.0",
     "com.unity.ide.rider": "1.1.1",
